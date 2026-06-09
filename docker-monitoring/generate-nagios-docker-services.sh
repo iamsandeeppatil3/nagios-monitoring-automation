@@ -1,32 +1,29 @@
 #!/bin/bash
 
 ###############################################################################
-# Script Name : nagios_docker_service_generator.sh
+# Script Name : generate-nrpe-docker-checks.sh
 # Author      : Sandeep Patil
 # Version     : 1.0
-# Created     : 2026-06-08
+# Created     : 2025-01-01
 # Updated     : 2026-06-08
 #
 # Purpose:
-#   Discovers Docker containers running on monitored Linux servers via NRPE
-#   and automatically generates Nagios service definitions for container
-#   health monitoring.
+#   Automatically generates NRPE command definitions for all Docker
+#   containers present on the host.
 #
 # Features:
-#   - Collects monitored hosts from Nagios configuration files
-#   - Retrieves Docker container names remotely using NRPE
-#   - Generates service definitions automatically
-#   - Validates Nagios configuration before deployment
-#   - Supports bulk onboarding of Docker-based services
+#   - Discovers Docker containers automatically
+#   - Generates NRPE command definitions
+#   - Creates or overwrites NRPE Docker configuration
+#   - Restarts NRPE service
 #
 # Requirements:
-#   - Nagios Core
-#   - NRPE
 #   - Docker
-#   - Bash 4+
+#   - NRPE
+#   - Nagios Docker check plugin
 #
 # Usage:
-#   ./nagios_docker_service_generator.sh
+#   ./generate-nrpe-docker-checks.sh
 #
 ###############################################################################
 
@@ -38,86 +35,59 @@ set -o pipefail
 # Configuration
 ###############################################################################
 
-INVENTORY_FILE="/path/to/inventory"
-HOST_CONFIG_DIR="/path/to/nagios/hosts"
-OUTPUT_DIR="/path/to/generated/service-definitions"
-NAGIOS_CONFIG="/path/to/nagios.cfg"
+NRPE_CONFIG_FILE="/etc/nagios/nrpe.d/docker.cfg"
+DOCKER_CHECK_PLUGIN="/usr/lib/nagios/plugins/check_docker"
 
 ###############################################################################
-# Build Host Inventory
+# Validation
 ###############################################################################
 
-grep -rE "address|alias" \
-    --include="*.cfg" \
-    "$HOST_CONFIG_DIR" \
-    | awk '{print $NF}' \
-    | paste - - \
-    | awk '{print $2, $1}' \
-    > "$INVENTORY_FILE"
+if ! command -v docker >/dev/null 2>&1
+then
+    echo "Docker is not installed."
+    exit 1
+fi
+
+if [[ ! -x "$DOCKER_CHECK_PLUGIN" ]]
+then
+    echo "Docker check plugin not found: $DOCKER_CHECK_PLUGIN"
+    exit 1
+fi
 
 ###############################################################################
-# Generate Service Definitions
+# Generate NRPE Commands
 ###############################################################################
 
-while read -r ip host
+echo "Generating NRPE Docker checks..."
+
+> "$NRPE_CONFIG_FILE"
+
+docker ps -a --format '{{.Names}}' | while read -r container
 do
-    echo "Discovering containers on ${host}..."
+    [[ -z "$container" ]] && continue
 
-    containers=$(
-        /usr/local/nagios/libexec/check_nrpe \
-            -H "$ip" \
-            -c list_docker_containers \
-            2>/dev/null \
-            | grep -v "NRPE:"
-    )
-
-    if [[ -z "$containers" ]]; then
-        echo "No containers found or NRPE unavailable on ${host}"
-        continue
-    fi
-
-    cfg_file="${OUTPUT_DIR}/${host}_docker-containers"
-
-    : > "$cfg_file"
-
-    for container in $containers
-    do
-        cat >> "$cfg_file" <<EOF
-define service{
-        use                             generic-service
-        host_name                       ${host}
-        service_description             ${container} container
-        check_command                   check_nrpe!check_${container}
-        notification_interval           15
-        check_interval                  1
-}
-EOF
-    done
-
-    echo "Generated service definitions for ${host}"
-
-done < "$INVENTORY_FILE"
-
-###############################################################################
-# Rename Generated Files
-###############################################################################
-
-for file in "$OUTPUT_DIR"/*_docker-containers
-do
-    [[ -f "${file}.cfg" ]] || mv "$file" "${file}.cfg"
+    echo "command[check_${container}]=$DOCKER_CHECK_PLUGIN $container" \
+        >> "$NRPE_CONFIG_FILE"
 done
 
 ###############################################################################
-# Validate Nagios Configuration
+# Restart NRPE
 ###############################################################################
 
-echo "Validating Nagios configuration..."
+echo "Restarting NRPE service..."
 
-if /usr/local/nagios/bin/nagios -v "$NAGIOS_CONFIG"
+if systemctl list-unit-files | grep -q "^nagios-nrpe-server"
 then
-    echo "Validation successful."
-    echo "Nagios configuration is ready for reload."
+    systemctl restart nagios-nrpe-server
+    systemctl status nagios-nrpe-server --no-pager
+elif systemctl list-unit-files | grep -q "^nrpe"
+then
+    systemctl restart nrpe
+    systemctl status nrpe --no-pager
 else
-    echo "Validation failed."
+    echo "NRPE service not found."
     exit 1
 fi
+
+echo
+echo "NRPE Docker check generation completed."
